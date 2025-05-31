@@ -1,12 +1,45 @@
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
+from datetime import datetime
+import logging
+from typing import Optional
 
-import pandas as pd
+import polars as pl
 import yt_dlp
+import httpx
+import os
 from fasthtml.common import *
 from monsterui.all import *
+from supabase import create_client, Client
 
 from utils import calculate_engagement_rate, format_duration, format_number
+
+from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+
+# Initialize Supabase client
+def init_supabase() -> Optional[Client]:
+    """Initialize Supabase client with proper error handling."""
+    try:
+        url: str = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+        key: str = os.environ.get("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+
+        if not url or not key:
+            logger.error("Missing Supabase environment variables")
+            raise ValueError("Missing Supabase configuration")
+
+        return create_client(url, key)
+    except Exception as e:
+        logger.error(f"Failed to initialize Supabase client: {str(e)}")
+        raise
+
 
 # CSS Classes
 CARD_BASE_CLS = "max-w-2xl mx-auto my-12 p-8 shadow-lg rounded-xl bg-white text-gray-900 hover:shadow-xl transition-shadow duration-300"
@@ -21,13 +54,19 @@ FLEX_COL_CENTER_CLS = "flex flex-col items-center px-4 space-y-4"
 # Choose a theme color (blue, green, red, etc)
 hdrs = Theme.red.headers()
 
-app, rt = fast_app(
-    hdrs=hdrs,
-    title="ViralVibes - YouTube Trends, Decoded",
-    static_dir="static",
-)
-# Set the favicon
-app.favicon = "/static/favicon.ico"
+app, rt = fast_app(hdrs=hdrs,
+                   title="ViralVibes - YouTube Trends, Decoded",
+                   static_dir="static",
+                   favicon="/static/favicon.ico",
+                   apple_touch_icon="/static/favicon.jpeg")
+
+# Initialize Supabase client after app creation
+try:
+    supabase: Client = init_supabase()
+    logger.info("Supabase client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Supabase client: {str(e)}")
+    raise
 
 # Navigation links
 scrollspy_links = (A("Home", href="#home-section"),
@@ -84,7 +123,7 @@ def validate_youtube_playlist(playlist: YoutubePlaylist):
     return errors
 
 
-def get_playlist_videos(playlist_url: str) -> pd.DataFrame:
+def get_playlist_videos(playlist_url: str) -> pl.DataFrame:
     """Fetches video information from a YouTube playlist URL."""
     ydl_opts = {
         "quiet": True,
@@ -111,8 +150,8 @@ def get_playlist_videos(playlist_url: str) -> pd.DataFrame:
                 "Thumbnail": video.get("thumbnail", ""),
             } for rank, video in enumerate(videos, start=1)]
 
-            return pd.DataFrame(data)
-    return pd.DataFrame([])
+            return pl.DataFrame(data)
+    return pl.DataFrame()
 
 
 def HeaderCard() -> Card:
@@ -217,15 +256,25 @@ def NewsletterCard() -> Card:
             type="email",
             name="email",
             required=True,
+            pattern="[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$",
+            title="Please enter a valid email address",
             placeholder="you@example.com",
             className=
-            "px-4 py-2 w-full max-w-sm border rounded focus:ring-2 focus:ring-red-500 focus:border-red-500 transition-all"
+            "px-4 py-2 w-full max-w-sm border rounded focus:ring-2 focus:ring-red-500 focus:border-red-500 transition-all invalid:border-red-500 invalid:focus:ring-red-500"
         ),
              Button("Notify Me",
                     type="submit",
                     className=
                     f"{ButtonT.primary} hover:scale-105 transition-transform"),
-             className="flex flex-col items-center space-y-4"),
+             Loading(id="loading",
+                     cls=(LoadingT.bars, LoadingT.lg),
+                     style="margin-top:1rem; display:none; color:#393e6e;",
+                     htmx_indicator=True),
+             className="flex flex-col items-center space-y-4",
+             hx_post="/newsletter",
+             hx_target="#newsletter-result",
+             hx_indicator="#loading"),
+        Div(id="newsletter-result", style="margin-top:1rem;"),
         header=CardTitle("Be the first to try it",
                          cls="text-xl font-bold mb-4"),
         cls=NEWSLETTER_CARD_CLS,
@@ -262,7 +311,7 @@ def index():
                       cls=(ContainerT.xl, 'uk-container-expand'))))
 
 
-def process_numeric_column(series: pd.Series) -> pd.Series:
+def process_numeric_column(series: pl.Series) -> pl.Series:
     """Helper to convert formatted string numbers to floats."""
 
     def convert_to_number(value):
@@ -277,7 +326,7 @@ def process_numeric_column(series: pd.Series) -> pd.Series:
             return float(value.replace('K', '')) * 1_000
         return float(value.replace(',', ''))
 
-    return series.apply(convert_to_number)
+    return series.map_elements(convert_to_number)
 
 
 @rt("/validate")
@@ -296,23 +345,29 @@ def validate(playlist: YoutubePlaylist):
                    id="result",
                    style="color: orange;")
 
-    if df is not None and not df.empty:
+    if df.height > 0:
         # Apply formatting functions to the DataFrame
-        df["View Count"] = df["View Count"].apply(format_number)
-        df["Like Count"] = df["Like Count"].apply(format_number)
-        df["Dislike Count"] = df["Dislike Count"].apply(format_number)
-        df["Duration"] = df["Duration"].apply(format_duration)
+        df = df.with_columns([
+            pl.col("View Count").map_elements(format_number),
+            pl.col("Like Count").map_elements(format_number),
+            pl.col("Dislike Count").map_elements(format_number),
+            pl.col("Duration").map_elements(format_duration)
+        ])
 
         # Calculate engagement rate
         view_counts_numeric = process_numeric_column(df["View Count"])
         like_counts_numeric = process_numeric_column(df["Like Count"])
         dislike_counts_numeric = process_numeric_column(df["Dislike Count"])
 
-        df["Engagement Rate (%)"] = [
-            f"{calculate_engagement_rate(vc, lc, dc):.2f}"
-            for vc, lc, dc in zip(view_counts_numeric, like_counts_numeric,
-                                  dislike_counts_numeric)
-        ]
+        df = df.with_columns([
+            pl.Series(name="Engagement Rate (%)",
+                      values=[
+                          f"{calculate_engagement_rate(vc, lc, dc):.2f}"
+                          for vc, lc, dc in
+                          zip(view_counts_numeric, like_counts_numeric,
+                              dislike_counts_numeric)
+                      ])
+        ])
 
         # Create table header
         headers = [
@@ -323,7 +378,7 @@ def validate(playlist: YoutubePlaylist):
 
         # Create table body
         tbody_rows = []
-        for _, row in df.iterrows():
+        for row in df.iter_rows(named=True):
             tbody_rows.append(
                 Tr(Td(row["Rank"]), Td(row["Title"]), Td(row["View Count"]),
                    Td(row["Like Count"]), Td(row["Dislike Count"]),
@@ -333,7 +388,7 @@ def validate(playlist: YoutubePlaylist):
         # Create table footer with summary
         total_views = view_counts_numeric.sum()
         total_likes = like_counts_numeric.sum()
-        avg_engagement = df["Engagement Rate (%)"].astype(float).mean()
+        avg_engagement = df["Engagement Rate (%)"].cast(pl.Float64).mean()
 
         tfoot = Tfoot(
             Tr(Td("Total/Average"), Td(""), Td(format_number(total_views)),
@@ -351,6 +406,44 @@ def validate(playlist: YoutubePlaylist):
         "Valid YouTube Playlist URL, but no videos were found or could not be retrieved.",
         id="result",
         style="color: orange;")
+
+
+import re
+
+
+@rt("/newsletter", methods=["POST"])
+def newsletter(email: str):
+    # Normalize email input by trimming whitespace and lowercasing
+    email = email.strip().lower()
+
+    # Comprehensive email validation using regex
+    email_regex = r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+    if not re.match(email_regex, email):
+        return Div("Please enter a valid email address.", style="color: red")
+
+    # Send to Supabase
+    payload = {"email": email, "created_at": datetime.utcnow().isoformat()}
+    try:
+        logger.info(f"Attempting to insert newsletter signup for: {email}")
+
+        # Insert data using Supabase client
+        data = supabase.table("signups").insert(payload).execute()
+
+        # Check if we have data in the response
+        if data.data:
+            logger.info(f"Successfully added newsletter signup for: {email}")
+            return Div("Thanks for signing up! 🎉", style="color: green")
+        else:
+            logger.warning(f"No data returned from Supabase for: {email}")
+            return Div(
+                "Unable to process your signup. Please try again later.",
+                style="color: orange")
+
+    except Exception as e:
+        logger.error(f"Newsletter signup failed for {email}: {str(e)}")
+        return Div(
+            "We're having trouble processing your signup. Please try again later.",
+            style="color: orange")
 
 
 serve()
